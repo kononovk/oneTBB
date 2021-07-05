@@ -136,8 +136,10 @@ void task_group_context_impl::destroy(d1::task_group_context& ctx) {
 #endif
     ctl->~cpu_ctl_env();
 
-    if (ctx.my_exception)
-        ctx.my_exception->destroy();
+    auto exception = ctx.my_exception.load(std::memory_order_relaxed);
+    if (exception) {
+        exception->destroy();
+    }
     ITT_STACK_DESTROY(ctx.my_itt_caller);
 
     poison_pointer(ctx.my_parent);
@@ -160,7 +162,7 @@ void task_group_context_impl::initialize(d1::task_group_context& ctx) {
     ctx.my_owner = nullptr;
     ctx.my_node.next.store(nullptr, std::memory_order_relaxed);
     ctx.my_node.next.store(nullptr, std::memory_order_relaxed);
-    ctx.my_exception = nullptr;
+    ctx.my_exception.store(nullptr, std::memory_order_relaxed);
     ctx.my_itt_caller = nullptr;
 
     static_assert(sizeof(d1::cpu_ctl_env) <= sizeof(ctx.my_cpu_ctl_env), "FPU settings storage does not fit to uint64_t");
@@ -385,9 +387,11 @@ void task_group_context_impl::reset(d1::task_group_context& ctx) {
     //! TODO: Add assertion that this context does not have children
     // No fences are necessary since this context can be accessed from another thread
     // only after stealing happened (which means necessary fences were used).
-    if (ctx.my_exception) {
-        ctx.my_exception->destroy();
-        ctx.my_exception = NULL;
+
+    auto exception = ctx.my_exception.load(std::memory_order_relaxed);
+    if (exception) {
+        exception->destroy();
+        ctx.my_exception.store(nullptr, std::memory_order_relaxed);
     }
     ctx.my_cancellation_requested = 0;
 }
