@@ -19,6 +19,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <unordered_map>
 
 #include "oneapi/tbb/detail/_task.h"
 
@@ -288,6 +289,11 @@ struct arena_base : padded<intrusive_list_node> {
     //! Used to trap accesses to the object after its destruction.
     std::uintptr_t my_guard;
 #endif /* TBB_USE_ASSERT */
+
+#if __TBB_HIERARCHICAL_STEALING_OPTIMIZATION
+    //! Map from numa nodes to range of slots to this numa node
+    std::unordered_map<numa_node_id, std::pair<int, int>> numa_intervals;
+#endif /* __TBB_HIERARCHICAL_STEALING_OPTIMIZATION */
 }; // struct arena_base
 
 class arena: public padded<arena_base>
@@ -352,6 +358,13 @@ public:
     bool is_recall_requested() const {
         return num_workers_active() > my_num_workers_allotted.load(std::memory_order_relaxed);
     }
+
+#if __TBB_HIERARCHICAL_STEALING_OPTIMIZATION
+    //! Check that numa optimization works for this arena
+    bool has_numa_optimization() const noexcept {
+        return info::numa_nodes().size() > 1 && my_num_slots == governor::default_num_threads() && my_num_reserved_slots == 1u;
+    }
+#endif
 
     //! If necessary, raise a flag that there is new job in arena.
     template<arena::new_work_type work_type> void advertise_new_work();
@@ -555,7 +568,60 @@ inline d1::task* arena::steal_task(unsigned arena_index, FastRandom& frnd, execu
         // No slots to steal from
         return nullptr;
     }
-    // Try to steal a task from a random victim.
+
+#if __TBB_HIERARCHICAL_STEALING_OPTIMIZATION
+    std::pair<int, int> range {0, 0};
+    if (has_numa_optimization()) {
+        for (auto& el : numa_intervals) {
+            if (arena_index >= static_cast<unsigned>(el.second.first) &&
+                arena_index < static_cast<unsigned>(el.second.second)) {
+                range = el.second;
+                break;
+            }
+        }
+    }
+#endif /* __TBB_HIERARCHICAL_STEALING_OPTIMIZATION */
+
+    auto try_steal_task_from_slot = [&](std::size_t slot_number) -> d1::task* {
+        arena_slot* victim = &my_slots[slot_number];
+        d1::task **pool = victim->task_pool.load(std::memory_order_relaxed);
+        d1::task *t = nullptr;
+        if (pool == EmptyTaskPool || !(t = victim->steal_task(*this, isolation, slot_number))) {
+            return nullptr;
+        }
+        if (task_accessor::is_proxy_task(*t)) {
+            task_proxy &tp = *(task_proxy*)t;
+            d1::slot_id slot = tp.slot;
+            t = tp.extract_task<task_proxy::pool_bit>();
+            if (!t) {
+                // Proxy was empty, so it's our responsibility to free it
+                tp.allocator.delete_object(&tp, ed);
+                return nullptr;
+            }
+            // Note affinity is called for any stolen task (proxy or general)
+            ed.affinity_slot = slot;
+        } else {
+            // Note affinity is called for any stolen task (proxy or general)
+            ed.affinity_slot = d1::any_slot;
+        }
+        // Update task owner thread id to identify stealing
+        ed.original_slot = slot_number;
+        return t;
+    };
+
+#if __TBB_HIERARCHICAL_STEALING_OPTIMIZATION
+    if (range.first < range.second) {
+        for (size_t i = 0; i < 10; ++i) {
+            std::size_t k = (frnd.get() % (range.second - range.first) + range.first) % (slot_num_limit - 1);
+            if (k >= arena_index) {
+                if (++k == static_cast<std::size_t>(range.second)) continue;
+            }
+            d1::task* res = try_steal_task_from_slot(k);
+            if (res) return res;
+        }
+    }
+#endif /* __TBB_HIERARCHICAL_STEALING_OPTIMIZATION */
+
     std::size_t k = frnd.get() % (slot_num_limit - 1);
     // The following condition excludes the external thread that might have
     // already taken our previous place in the arena from the list .
@@ -565,30 +631,7 @@ inline d1::task* arena::steal_task(unsigned arena_index, FastRandom& frnd, execu
     if (k >= arena_index) {
         ++k; // Adjusts random distribution to exclude self
     }
-    arena_slot* victim = &my_slots[k];
-    d1::task **pool = victim->task_pool.load(std::memory_order_relaxed);
-    d1::task *t = nullptr;
-    if (pool == EmptyTaskPool || !(t = victim->steal_task(*this, isolation, k))) {
-        return nullptr;
-    }
-    if (task_accessor::is_proxy_task(*t)) {
-        task_proxy &tp = *(task_proxy*)t;
-        d1::slot_id slot = tp.slot;
-        t = tp.extract_task<task_proxy::pool_bit>();
-        if (!t) {
-            // Proxy was empty, so it's our responsibility to free it
-            tp.allocator.delete_object(&tp, ed);
-            return nullptr;
-        }
-        // Note affinity is called for any stolen task (proxy or general)
-        ed.affinity_slot = slot;
-    } else {
-        // Note affinity is called for any stolen task (proxy or general)
-        ed.affinity_slot = d1::any_slot;
-    }
-    // Update task owner thread id to identify stealing
-    ed.original_slot = k;
-    return t;
+    return try_steal_task_from_slot(k);
 }
 
 template<task_stream_accessor_type accessor>
